@@ -1,0 +1,7 @@
+*.exe
+bin/
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log

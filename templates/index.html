@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LiveForge License Admin</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 24px;
+        background: #111827;
+        color: #e5e7eb;
+      }
+      h1, h2 { margin: 0 0 12px 0; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 16px;
+      }
+      .card {
+        background: #1f2937;
+        border: 1px solid #374151;
+        border-radius: 10px;
+        padding: 16px;
+      }
+      label { display: block; margin: 10px 0 6px; }
+      input, select, button {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 8px;
+        border: 1px solid #4b5563;
+        background: #0f172a;
+        color: #e5e7eb;
+        padding: 10px 12px;
+      }
+      button {
+        background: #2563eb;
+        border: none;
+        cursor: pointer;
+        margin-top: 12px;
+      }
+      button:hover { background: #1d4ed8; }
+      pre {
+        background: #0b1220;
+        border: 1px solid #374151;
+        border-radius: 8px;
+        padding: 12px;
+        overflow: auto;
+        min-height: 80px;
+      }
+      .muted { color: #9ca3af; font-size: 12px; }
+      .list { max-height: 280px; overflow: auto; border: 1px solid #374151; border-radius: 8px; }
+      .item { padding: 10px 12px; border-bottom: 1px solid #374151; }
+      .item:last-child { border-bottom: none; }
+      code { color: #93c5fd; }
+    </style>
+  </head>
+  <body>
+    <h1>LiveForge License Admin</h1>
+    <p class="muted">Minimal admin UI for users, keys and verification.</p>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Create User</h2>
+        <label>Name</label>
+        <input id="userName" placeholder="Tester Name" />
+        <label>Email</label>
+        <input id="userEmail" type="email" placeholder="tester@example.com" />
+        <button onclick="createUser()">Create user</button>
+        <pre id="userResult"></pre>
+      </section>
+
+      <section class="card">
+        <h2>Create Key</h2>
+        <label>User</label>
+        <select id="userSelect"></select>
+        <label>Max devices</label>
+        <input id="maxDevices" type="number" value="2" min="1" max="100" />
+        <label>Expires at (optional RFC3339)</label>
+        <input id="expiresAt" placeholder="2027-01-01T00:00:00Z" />
+        <button onclick="createKey()">Create key</button>
+        <pre id="keyResult"></pre>
+      </section>
+
+      <section class="card">
+        <h2>Verify Key</h2>
+        <label>License key</label>
+        <input id="verifyKey" placeholder="LF-XXXX-XXXX-XXXX-XXXX" />
+        <label>Machine ID (optional, activates when new)</label>
+        <input id="verifyMachine" placeholder="machine-001" />
+        <button onclick="verifyKey()">Verify key</button>
+        <pre id="verifyResult"></pre>
+      </section>
+    </div>
+
+    <div class="grid" style="margin-top:16px;">
+      <section class="card">
+        <h2>Users</h2>
+        <div id="usersList" class="list"></div>
+      </section>
+      <section class="card">
+        <h2>Keys</h2>
+        <div id="keysList" class="list"></div>
+      </section>
+    </div>
+
+    <script>
+      async function api(url, options = {}) {
+        const res = await fetch(url, {
+          headers: { "content-type": "application/json" },
+          ...options,
+        });
+        const data = await res.json().catch(() => ({}));
+        return { ok: res.ok, status: res.status, data };
+      }
+
+      function print(el, value) {
+        el.textContent = JSON.stringify(value, null, 2);
+      }
+
+      async function refresh() {
+        const users = await api("/api/users");
+        const keys = await api("/api/keys");
+
+        const usersList = document.getElementById("usersList");
+        const userSelect = document.getElementById("userSelect");
+        usersList.innerHTML = "";
+        userSelect.innerHTML = "";
+        (users.data.users || []).forEach((u) => {
+          const div = document.createElement("div");
+          div.className = "item";
+          div.innerHTML = `<strong>${u.name}</strong><br><span class="muted">${u.email}</span><br><code>${u.id}</code>`;
+          usersList.appendChild(div);
+
+          const opt = document.createElement("option");
+          opt.value = u.id;
+          opt.textContent = `${u.name} (${u.email})`;
+          userSelect.appendChild(opt);
+        });
+
+        const keysList = document.getElementById("keysList");
+        keysList.innerHTML = "";
+        (keys.data.keys || []).forEach((k) => {
+          const div = document.createElement("div");
+          div.className = "item";
+          div.innerHTML = `<strong>${k.key}</strong><br><span class="muted">user=${k.user_id}, devices=${k.activations.length}/${k.max_devices}, status=${k.status}</span>`;
+          keysList.appendChild(div);
+        });
+      }
+
+      async function createUser() {
+        const name = document.getElementById("userName").value.trim();
+        const email = document.getElementById("userEmail").value.trim();
+        const result = await api("/api/users", {
+          method: "POST",
+          body: JSON.stringify({ name, email }),
+        });
+        print(document.getElementById("userResult"), result);
+        await refresh();
+      }
+
+      async function createKey() {
+        const user_id = document.getElementById("userSelect").value;
+        const max_devices = Number(document.getElementById("maxDevices").value || "2");
+        const expires_at = document.getElementById("expiresAt").value.trim();
+        const payload = { user_id, max_devices };
+        if (expires_at) payload.expires_at = expires_at;
+        const result = await api("/api/keys", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        print(document.getElementById("keyResult"), result);
+        await refresh();
+      }
+
+      async function verifyKey() {
+        const key = document.getElementById("verifyKey").value.trim();
+        const machine_id = document.getElementById("verifyMachine").value.trim();
+        const payload = { key };
+        if (machine_id) payload.machine_id = machine_id;
+        const result = await api("/api/keys/verify", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        print(document.getElementById("verifyResult"), result);
+        await refresh();
+      }
+
+      refresh();
+    </script>
+  </body>
+</html>
