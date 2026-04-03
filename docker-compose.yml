@@ -19,6 +19,8 @@ services:
       ADDR: ":8085"
       DATA_FILE: "/app/data/license-db.json"
       UPDATES_DIR: "/app/updates"
+      UPDATES_UPLOAD_TOKEN: "${UPDATES_UPLOAD_TOKEN}"
+      UPDATES_MAX_UPLOAD_MB: "${UPDATES_MAX_UPLOAD_MB:-2048}"
     volumes:
       - ./data:/app/data
       - ./updates:/app/updates

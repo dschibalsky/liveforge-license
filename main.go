@@ -2,6 +2,7 @@ package main
 
 import (
 	cryptoRand "crypto/rand"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,17 +52,27 @@ type dbData struct {
 }
 
 type app struct {
-	mu         sync.Mutex
-	dataFile   string
-	updatesDir string
-	data       dbData
-	tpl        *template.Template
+	mu                 sync.Mutex
+	dataFile           string
+	updatesDir         string
+	updatesUploadToken string
+	maxUploadBytes     int64
+	data               dbData
+	tpl                *template.Template
 }
 
 func main() {
 	addr := getenv("ADDR", ":8085")
 	dataFile := getenv("DATA_FILE", "./data/license-db.json")
 	updatesDir := getenv("UPDATES_DIR", "./updates")
+	updatesUploadToken := getenv("UPDATES_UPLOAD_TOKEN", "")
+	maxUploadMB := getenv("UPDATES_MAX_UPLOAD_MB", "2048")
+	maxUploadBytes := int64(2 * 1024 * 1024 * 1024)
+	if strings.TrimSpace(maxUploadMB) != "" {
+		if mb, err := strconv.ParseInt(strings.TrimSpace(maxUploadMB), 10, 64); err == nil && mb > 0 {
+			maxUploadBytes = mb * 1024 * 1024
+		}
+	}
 
 	tpl, err := template.ParseFS(templatesFS, "templates/*.html")
 	if err != nil {
@@ -68,9 +80,11 @@ func main() {
 	}
 
 	a := &app{
-		dataFile:   dataFile,
-		updatesDir: updatesDir,
-		tpl:        tpl,
+		dataFile:           dataFile,
+		updatesDir:         updatesDir,
+		updatesUploadToken: updatesUploadToken,
+		maxUploadBytes:     maxUploadBytes,
+		tpl:                tpl,
 	}
 	if err := a.load(); err != nil {
 		log.Fatalf("load db: %v", err)
@@ -84,6 +98,8 @@ func main() {
 	mux.HandleFunc("/api/users", a.handleUsers)
 	mux.HandleFunc("/api/keys", a.handleKeys)
 	mux.HandleFunc("/api/keys/verify", a.handleVerifyKey)
+	mux.HandleFunc("/api/updates/upload", a.handleUploadUpdateAsset)
+	mux.HandleFunc("/api/updates/files", a.handleListUpdateAssets)
 	mux.Handle("/updates/",
 		http.StripPrefix(
 			"/updates/",
@@ -320,6 +336,149 @@ func (a *app) handleVerifyKey(w http.ResponseWriter, r *http.Request) {
 			"expires_at":     rec.ExpiresAt,
 		},
 		"validated_at": nowISO(),
+	})
+}
+
+func (a *app) hasValidUpdateUploadToken(r *http.Request) bool {
+	if strings.TrimSpace(a.updatesUploadToken) == "" {
+		return true
+	}
+	got := strings.TrimSpace(r.Header.Get("x-updates-upload-token"))
+	if got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(a.updatesUploadToken)) == 1
+}
+
+func sanitizeUploadName(raw string) string {
+	name := strings.TrimSpace(filepath.Base(raw))
+	if name == "" || name == "." || name == ".." {
+		return ""
+	}
+	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return ""
+	}
+	return name
+}
+
+func (a *app) handleUploadUpdateAsset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !a.hasValidUpdateUploadToken(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"ok":    false,
+			"error": "unauthorized_upload_token",
+		})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, a.maxUploadBytes)
+	if err := r.ParseMultipartForm(a.maxUploadBytes); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "invalid_multipart_or_file_too_large",
+		})
+		return
+	}
+
+	src, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "missing_file",
+		})
+		return
+	}
+	defer src.Close()
+
+	name := sanitizeUploadName(hdr.Filename)
+	if custom := sanitizeUploadName(r.FormValue("name")); custom != "" {
+		name = custom
+	}
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "invalid_filename",
+		})
+		return
+	}
+
+	target := filepath.Join(a.updatesDir, name)
+	tmp := target + ".uploading"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"ok":    false,
+			"error": "open_target_failed",
+		})
+		return
+	}
+	n, copyErr := io.Copy(out, src)
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"ok":    false,
+			"error": "write_failed",
+		})
+		return
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"ok":    false,
+			"error": "finalize_failed",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"file":     name,
+		"bytes":    n,
+		"url_path": "/updates/" + name,
+	})
+}
+
+func (a *app) handleListUpdateAssets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !a.hasValidUpdateUploadToken(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"ok":    false,
+			"error": "unauthorized_upload_token",
+		})
+		return
+	}
+	entries, err := os.ReadDir(a.updatesDir)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"ok":    false,
+			"error": "list_failed",
+		})
+		return
+	}
+	files := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, map[string]any{
+			"name":        e.Name(),
+			"bytes":       info.Size(),
+			"modified_at": info.ModTime().UTC().Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":    true,
+		"files": files,
 	})
 }
 

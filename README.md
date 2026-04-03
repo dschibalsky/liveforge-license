@@ -13,12 +13,14 @@ Small standalone admin backend to create users, generate license keys, verify ke
   - `GET /api/keys`
   - `POST /api/keys`
   - `POST /api/keys/verify`
+  - `POST /api/updates/upload` (admin/upload token protected)
+  - `GET /api/updates/files` (admin/upload token protected)
 - Public updater static hosting under `/updates/` (e.g. `/updates/latest.json`)
 
 ## Run locally
 
 ```bash
-cd license-backend
+cd backend
 go run .
 ```
 
@@ -29,11 +31,13 @@ Optional env vars:
 - `ADDR` (example: `:8085`)
 - `DATA_FILE` (example: `/data/license-db.json`)
 - `UPDATES_DIR` (example: `/app/updates`)
+- `UPDATES_UPLOAD_TOKEN` (optional but recommended for update upload/list APIs)
+- `UPDATES_MAX_UPLOAD_MB` (default: `2048`)
 
 ## Docker / Compose
 
 ```bash
-cd license-backend
+cd backend
 docker compose up -d --build
 ```
 
@@ -54,13 +58,21 @@ The compose setup routes through the `proxy` network with split access:
 When your source repo is private, desktop clients cannot pull updater artifacts directly from private GitHub Releases without auth.  
 For test phase, host updater artifacts in this service:
 
-1. Put updater files into `license-backend/updates/`:
+1. Put updater files into `backend/updates/`:
    - `latest.json`
    - platform files referenced by `latest.json` (e.g. `.exe`, `.dmg`, signatures)
-2. Deploy/restart compose.
-3. Verify URLs are reachable publicly (without BasicAuth), e.g.:
+   - alternatively upload via API:
+     - `POST /api/updates/upload` with multipart field `file=@...`
+     - optional header `x-updates-upload-token: <UPDATES_UPLOAD_TOKEN>`
+     - example:
+       - `curl -u "<admin-user>:<admin-password>" -H "x-updates-upload-token: <token>" -F "file=@latest.json" https://liveforge.hideandpass.com/api/updates/upload`
+2. (optional) verify current uploaded files:
+   - `GET /api/updates/files`
+   - include `x-updates-upload-token` when configured
+3. Deploy/restart compose.
+4. Verify URLs are reachable publicly (without BasicAuth), e.g.:
    - `https://liveforge.hideandpass.com/updates/latest.json`
-4. Point Tauri updater endpoint to that URL.
+5. Point Tauri updater endpoint to that URL.
 
 Setup:
 
