@@ -18,8 +18,10 @@ services:
     environment:
       ADDR: ":8085"
       DATA_FILE: "/app/data/license-db.json"
+      UPDATES_DIR: "/app/updates"
     volumes:
       - ./data:/app/data
+      - ./updates:/app/updates
     labels:
       - "traefik.enable=true"
       # Public API route for app-side license checks (no BasicAuth)
@@ -32,7 +34,7 @@ services:
 
       # Admin/UI route with BasicAuth (covers / and all other API admin endpoints)
       - "traefik.http.routers.liveforge-license-admin.entrypoints=https"
-      - "traefik.http.routers.liveforge-license-admin.rule=Host(`liveforge.hideandpass.com`) && !Path(`/api/keys/verify`)"
+      - "traefik.http.routers.liveforge-license-admin.rule=Host(`liveforge.hideandpass.com`) && !Path(`/api/keys/verify`) && !PathPrefix(`/updates/`)"
       - "traefik.http.routers.liveforge-license-admin.priority=100"
       - "traefik.http.routers.liveforge-license-admin.tls=true"
       - "traefik.http.routers.liveforge-license-admin.tls.certresolver=http"
@@ -43,6 +45,13 @@ services:
 
       - "traefik.http.services.liveforge-license.loadbalancer.server.port=8085"
       - "traefik.http.routers.liveforge-license-api.middlewares=gzip,security-headers"
+      - "traefik.http.routers.liveforge-updates.entrypoints=https"
+      - "traefik.http.routers.liveforge-updates.rule=Host(`liveforge.hideandpass.com`) && PathPrefix(`/updates/`)"
+      - "traefik.http.routers.liveforge-updates.priority=190"
+      - "traefik.http.routers.liveforge-updates.tls=true"
+      - "traefik.http.routers.liveforge-updates.tls.certresolver=http"
+      - "traefik.http.routers.liveforge-updates.service=liveforge-license"
+      - "traefik.http.routers.liveforge-updates.middlewares=gzip,security-headers"
       - "traefik.docker.network=proxy"
     networks:
       - proxy

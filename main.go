@@ -28,7 +28,7 @@ type userRecord struct {
 }
 
 type activationRecord struct {
-	MachineID  string `json:"machine_id"`
+	MachineID   string `json:"machine_id"`
 	ActivatedAt string `json:"activated_at"`
 	LastSeenAt  string `json:"last_seen_at"`
 }
@@ -50,15 +50,17 @@ type dbData struct {
 }
 
 type app struct {
-	mu       sync.Mutex
-	dataFile string
-	data     dbData
-	tpl      *template.Template
+	mu         sync.Mutex
+	dataFile   string
+	updatesDir string
+	data       dbData
+	tpl        *template.Template
 }
 
 func main() {
 	addr := getenv("ADDR", ":8085")
 	dataFile := getenv("DATA_FILE", "./data/license-db.json")
+	updatesDir := getenv("UPDATES_DIR", "./updates")
 
 	tpl, err := template.ParseFS(templatesFS, "templates/*.html")
 	if err != nil {
@@ -66,11 +68,15 @@ func main() {
 	}
 
 	a := &app{
-		dataFile: dataFile,
-		tpl:      tpl,
+		dataFile:   dataFile,
+		updatesDir: updatesDir,
+		tpl:        tpl,
 	}
 	if err := a.load(); err != nil {
 		log.Fatalf("load db: %v", err)
+	}
+	if err := os.MkdirAll(a.updatesDir, 0o755); err != nil {
+		log.Fatalf("prepare updates dir: %v", err)
 	}
 
 	mux := http.NewServeMux()
@@ -78,6 +84,12 @@ func main() {
 	mux.HandleFunc("/api/users", a.handleUsers)
 	mux.HandleFunc("/api/keys", a.handleKeys)
 	mux.HandleFunc("/api/keys/verify", a.handleVerifyKey)
+	mux.Handle("/updates/",
+		http.StripPrefix(
+			"/updates/",
+			http.FileServer(http.Dir(a.updatesDir)),
+		),
+	)
 
 	log.Printf("license backend listening on %s", addr)
 	if err := http.ListenAndServe(addr, loggingMiddleware(mux)); err != nil {
@@ -300,12 +312,12 @@ func (a *app) handleVerifyKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true,
 		"license": map[string]any{
-			"key_last4":     rec.KeyLast4,
-			"user_id":       rec.UserID,
-			"status":        rec.Status,
-			"max_devices":   rec.MaxDevices,
+			"key_last4":      rec.KeyLast4,
+			"user_id":        rec.UserID,
+			"status":         rec.Status,
+			"max_devices":    rec.MaxDevices,
 			"active_devices": len(rec.Activations),
-			"expires_at":    rec.ExpiresAt,
+			"expires_at":     rec.ExpiresAt,
 		},
 		"validated_at": nowISO(),
 	})

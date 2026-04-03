@@ -1,6 +1,6 @@
 # LiveForge Minimal License Backend (Go)
 
-Small standalone admin backend to create users, generate license keys, and verify keys.
+Small standalone admin backend to create users, generate license keys, verify keys, and (for test phase) host Tauri updater assets.
 
 ## What it includes
 
@@ -13,6 +13,7 @@ Small standalone admin backend to create users, generate license keys, and verif
   - `GET /api/keys`
   - `POST /api/keys`
   - `POST /api/keys/verify`
+- Public updater static hosting under `/updates/` (e.g. `/updates/latest.json`)
 
 ## Run locally
 
@@ -27,6 +28,7 @@ Optional env vars:
 
 - `ADDR` (example: `:8085`)
 - `DATA_FILE` (example: `/data/license-db.json`)
+- `UPDATES_DIR` (example: `/app/updates`)
 
 ## Docker / Compose
 
@@ -44,7 +46,21 @@ Included files:
 The compose setup routes through the `proxy` network with split access:
 
 - `POST /api/keys/verify` is public (no BasicAuth) for app-side license checks.
+- `/updates/*` is public (no BasicAuth) for Tauri updater manifest + binaries during test phase.
 - Admin UI (`/`) and all other admin API routes require BasicAuth.
+
+## Updater assets for private repo test phase
+
+When your source repo is private, desktop clients cannot pull updater artifacts directly from private GitHub Releases without auth.  
+For test phase, host updater artifacts in this service:
+
+1. Put updater files into `license-backend/updates/`:
+   - `latest.json`
+   - platform files referenced by `latest.json` (e.g. `.exe`, `.dmg`, signatures)
+2. Deploy/restart compose.
+3. Verify URLs are reachable publicly (without BasicAuth), e.g.:
+   - `https://liveforge.hideandpass.com/updates/latest.json`
+4. Point Tauri updater endpoint to that URL.
 
 Setup:
 
