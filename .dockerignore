@@ -1,0 +1,6 @@
+data/
+updates/
+.env
+.env.*
+!/.env.example
+.git/
