@@ -11,6 +11,8 @@ services:
       dockerfile: Dockerfile
     container_name: liveforge-license-backend
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       ADDR: ":8085"
       DATA_FILE: "/app/data/license-db.json"

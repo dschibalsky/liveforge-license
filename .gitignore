@@ -1,6 +1,7 @@
 *.exe
 bin/
 data/
+.env
 *.db
 *.sqlite
 *.sqlite3

@@ -39,13 +39,24 @@ Included files:
 
 - `Dockerfile`
 - `docker-compose.yml` (Traefik labels for `liveforge.hideandpass.com`)
+- `.env.example`
 
 The compose setup routes through the `proxy` network with split access:
 
 - `POST /api/keys/verify` is public (no BasicAuth) for app-side license checks.
 - Admin UI (`/`) and all other admin API routes require BasicAuth.
 
-Set `BASIC_AUTH_USERS` before `docker compose up` (Traefik htpasswd format, e.g. `user:$$apr1$$...`).
+Setup:
+
+1. Copy `.env.example` to `.env`
+2. Set `BASIC_AUTH_USERS` in htpasswd format (`user:hash`) and replace every `$` with `$$`
+3. Run `docker compose up -d --build`
+
+Hash generation (Python/bcrypt example):
+
+```bash
+python -c "import bcrypt; print(bcrypt.hashpw(b'MY_PASSWORD', bcrypt.gensalt()).decode())"
+```
 
 ## Security note
 
