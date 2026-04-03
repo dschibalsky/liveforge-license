@@ -1,4 +1,4 @@
-version: "3.8"
+version: "3.3"
 
 networks:
   proxy:
@@ -32,12 +32,13 @@ services:
 
       # Admin/UI route with BasicAuth (covers / and all other API admin endpoints)
       - "traefik.http.routers.liveforge-license-admin.entrypoints=https"
-      - "traefik.http.routers.liveforge-license-admin.rule=Host(`liveforge.hideandpass.com`)"
+      - "traefik.http.routers.liveforge-license-admin.rule=Host(`liveforge.hideandpass.com`) && !Path(`/api/keys/verify`)"
       - "traefik.http.routers.liveforge-license-admin.priority=100"
       - "traefik.http.routers.liveforge-license-admin.tls=true"
       - "traefik.http.routers.liveforge-license-admin.tls.certresolver=http"
       - "traefik.http.routers.liveforge-license-admin.service=liveforge-license"
       - "traefik.http.middlewares.liveforge-license-auth.basicauth.users=${BASIC_AUTH_USERS}"
+      - "traefik.http.middlewares.liveforge-license-auth.basicauth.realm=LiveForge Admin"
       - "traefik.http.routers.liveforge-license-admin.middlewares=gzip,security-headers,liveforge-license-auth"
 
       - "traefik.http.services.liveforge-license.loadbalancer.server.port=8085"
