@@ -17,7 +17,7 @@ Small standalone admin backend to create users, generate license keys, and verif
 ## Run locally
 
 ```bash
-cd license-backend-go
+cd license-backend
 go run .
 ```
 
@@ -28,26 +28,24 @@ Optional env vars:
 - `ADDR` (example: `:8085`)
 - `DATA_FILE` (example: `/data/license-db.json`)
 
-## Docker example (service only)
+## Docker / Compose
 
-```yaml
-license_backend:
-  image: golang:1.22-alpine
-  container_name: liveforge-license-backend
-  working_dir: /app
-  command: sh -c "go run ."
-  environment:
-    ADDR: ":8085"
-    DATA_FILE: "/data/license-db.json"
-  volumes:
-    - ./license-backend-go:/app
-    - ./license-data:/data
-  restart: unless-stopped
-  networks:
-    - internal
+```bash
+cd license-backend
+docker compose up -d --build
 ```
 
-Then route it via your reverse proxy to `liveforge.hideandpass.com` and keep BasicAuth at proxy level.
+Included files:
+
+- `Dockerfile`
+- `docker-compose.yml` (Traefik labels for `liveforge.hideandpass.com`)
+
+The compose setup routes through the `proxy` network with split access:
+
+- `POST /api/keys/verify` is public (no BasicAuth) for app-side license checks.
+- Admin UI (`/`) and all other admin API routes require BasicAuth.
+
+Set `BASIC_AUTH_USERS` before `docker compose up` (Traefik htpasswd format, e.g. `user:$$apr1$$...`).
 
 ## Security note
 

@@ -1,0 +1,44 @@
+networks:
+  proxy:
+    external: true
+  internal:
+    external: false
+
+services:
+  license-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: liveforge-license-backend
+    restart: unless-stopped
+    environment:
+      ADDR: ":8085"
+      DATA_FILE: "/app/data/license-db.json"
+    volumes:
+      - ./data:/app/data
+    labels:
+      - "traefik.enable=true"
+      # Public API route for app-side license checks (no BasicAuth)
+      - "traefik.http.routers.liveforge-license-api.entrypoints=https"
+      - "traefik.http.routers.liveforge-license-api.rule=Host(`liveforge.hideandpass.com`) && Path(`/api/keys/verify`)"
+      - "traefik.http.routers.liveforge-license-api.priority=200"
+      - "traefik.http.routers.liveforge-license-api.tls=true"
+      - "traefik.http.routers.liveforge-license-api.tls.certresolver=http"
+      - "traefik.http.routers.liveforge-license-api.service=liveforge-license"
+
+      # Admin/UI route with BasicAuth (covers / and all other API admin endpoints)
+      - "traefik.http.routers.liveforge-license-admin.entrypoints=https"
+      - "traefik.http.routers.liveforge-license-admin.rule=Host(`liveforge.hideandpass.com`)"
+      - "traefik.http.routers.liveforge-license-admin.priority=100"
+      - "traefik.http.routers.liveforge-license-admin.tls=true"
+      - "traefik.http.routers.liveforge-license-admin.tls.certresolver=http"
+      - "traefik.http.routers.liveforge-license-admin.service=liveforge-license"
+      - "traefik.http.middlewares.liveforge-license-auth.basicauth.users=${BASIC_AUTH_USERS}"
+      - "traefik.http.routers.liveforge-license-admin.middlewares=gzip,security-headers,liveforge-license-auth"
+
+      - "traefik.http.services.liveforge-license.loadbalancer.server.port=8085"
+      - "traefik.http.routers.liveforge-license-api.middlewares=gzip,security-headers"
+      - "traefik.docker.network=proxy"
+    networks:
+      - proxy
+      - internal
