@@ -55,9 +55,76 @@ type licenseRecord struct {
 	ConsumedTraceIDs []string `json:"consumed_trace_ids,omitempty"`
 }
 
+// hostedTierTriple is OpenRouter model ids for main / compose / utility (hosted billing).
+type hostedTierTriple struct {
+	Model        string `json:"model"`
+	ComposeModel string `json:"compose_model"`
+	UtilityModel string `json:"utility_model"`
+}
+
 type dbData struct {
-	Users    []userRecord    `json:"users"`
-	Licenses []licenseRecord `json:"licenses"`
+	Users             []userRecord               `json:"users"`
+	Licenses          []licenseRecord            `json:"licenses"`
+	HostedTierPresets map[string]hostedTierTriple `json:"hosted_tier_presets,omitempty"`
+}
+
+func defaultHostedTierPresets() map[string]hostedTierTriple {
+	// Keep in sync with gui/app/lib/tier-presets.ts HOSTED_OPENROUTER_TIER_PRESETS.
+	return map[string]hostedTierTriple{
+		"t1": {
+			Model:        "google/gemini-2.5-flash",
+			ComposeModel: "google/gemini-2.5-flash",
+			UtilityModel: "google/gemini-2.5-flash",
+		},
+		"t2": {
+			Model:        "google/gemini-3-flash-preview",
+			ComposeModel: "google/gemini-3-flash-preview",
+			UtilityModel: "google/gemini-2.5-flash",
+		},
+		"t3": {
+			Model:        "anthropic/claude-sonnet-4-6",
+			ComposeModel: "anthropic/claude-sonnet-4-6",
+			UtilityModel: "google/gemini-2.5-pro",
+		},
+	}
+}
+
+func tripleOK(t hostedTierTriple) bool {
+	return strings.TrimSpace(t.Model) != "" &&
+		strings.TrimSpace(t.ComposeModel) != "" &&
+		strings.TrimSpace(t.UtilityModel) != ""
+}
+
+// ensureHostedTierPresets fills missing or invalid t1/t2/t3 entries; returns true if db should be saved.
+func ensureHostedTierPresets(d *dbData) bool {
+	changed := false
+	if d.HostedTierPresets == nil {
+		d.HostedTierPresets = make(map[string]hostedTierTriple)
+		changed = true
+	}
+	for tier, def := range defaultHostedTierPresets() {
+		cur, ok := d.HostedTierPresets[tier]
+		if !ok || !tripleOK(cur) {
+			d.HostedTierPresets[tier] = def
+			changed = true
+		}
+	}
+	return changed
+}
+
+func hostedTierPresetsJSON(p map[string]hostedTierTriple) map[string]any {
+	if len(p) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(p))
+	for k, v := range p {
+		out[k] = map[string]any{
+			"model":         v.Model,
+			"compose_model": v.ComposeModel,
+			"utility_model": v.UtilityModel,
+		}
+	}
+	return out
 }
 
 type app struct {
@@ -427,12 +494,12 @@ func (a *app) handleVerifyKey(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":           true,
-		"license":      licenseVerifyJSON(rec),
+		"license":      a.licenseVerifyJSON(rec),
 		"validated_at": nowISO(),
 	})
 }
 
-func licenseVerifyJSON(rec *licenseRecord) map[string]any {
+func (a *app) licenseVerifyJSON(rec *licenseRecord) map[string]any {
 	out := map[string]any{
 		"key_last4":       rec.KeyLast4,
 		"user_id":         rec.UserID,
@@ -445,6 +512,9 @@ func licenseVerifyJSON(rec *licenseRecord) map[string]any {
 	}
 	if strings.EqualFold(rec.BillingMode, "hosted") {
 		out["wallet_balance_usd"] = rec.WalletBalanceUSD
+		if j := hostedTierPresetsJSON(a.data.HostedTierPresets); j != nil {
+			out["hosted_tier_presets"] = j
+		}
 	}
 	if rec.ModelTier != "" {
 		out["model_tier"] = rec.ModelTier
@@ -537,7 +607,7 @@ func (a *app) handleConsumeWallet(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, t := range rec.ConsumedTraceIDs {
 		if t == req.TraceID {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "idempotent": true, "license": licenseVerifyJSON(rec)})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "idempotent": true, "license": a.licenseVerifyJSON(rec)})
 			return
 		}
 	}
@@ -554,7 +624,7 @@ func (a *app) handleConsumeWallet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "save_failed"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "license": licenseVerifyJSON(rec)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "license": a.licenseVerifyJSON(rec)})
 }
 
 func (a *app) handleKeyRevoke(w http.ResponseWriter, r *http.Request) {
@@ -921,6 +991,11 @@ func (a *app) load() error {
 		a.data.Licenses = []licenseRecord{}
 	}
 	migrateLicenses(&a.data.Licenses)
+	if ensureHostedTierPresets(&a.data) {
+		if err := a.saveLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
