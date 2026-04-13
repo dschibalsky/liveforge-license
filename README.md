@@ -29,11 +29,11 @@ Small standalone admin backend: users, license keys, verify, **hosted prepaid wa
 | --- | --- |
 | `billing_mode` | `byok` (default) or `hosted` |
 | `allowed_edition` | `full` or `cloud` (for client enforcement) |
-| `wallet_balance_usd` | Prepaid balance when `hosted` |
+| `wallet_balance_usd` | Server-side allowance when `hosted` (debits + meter math; cloud UI shows a qualitative meter, not this number as “cash”) |
 | `model_tier` | Optional `t1` / `t2` / `t3` for hosted routing |
 | `consumed_trace_ids` | Last N trace IDs used for idempotent `/api/keys/consume` |
 
-Verify response `license` object includes `billing_mode`, `allowed_edition`, and for hosted `wallet_balance_usd` + `model_tier` when set — matches the LiveForge desktop `PublicLicenseMeta` shape.
+Verify response `license` object includes `billing_mode`, `allowed_edition`, and for hosted `wallet_balance_usd` + `hosted_tier_presets` + `model_tier` when set — matches the LiveForge desktop `PublicLicenseMeta` shape (see `gui/app/lib/license-backend-client.ts`). TypedDict reference: `backend/liveforge_license_verify.py`.
 
 ### Next.js (GUI) env
 
@@ -42,6 +42,11 @@ Point the app at this service:
 - `LIVEFORGE_LICENSE_BACKEND_VERIFY_URL` — e.g. `https://your-host/api/keys/verify`
 - `LIVEFORGE_LICENSE_BACKEND_CONSUME_URL` — e.g. `https://your-host/api/keys/consume`
 - `LIVEFORGE_LICENSE_BACKEND_CONSUME_SECRET` — same value as backend `CONSUME_SECRET` (server-side only in production)
+
+Optional **checkout** URLs for credit packs (browser-exposed `NEXT_PUBLIC_*`):
+
+- `NEXT_PUBLIC_LIVEFORGE_TOPUP_URL` — if set without per-tier URLs, the GUI can show three neutral buttons that append `liveforge_pack=15`, `30`, or `60` for your shop to route.
+- `NEXT_PUBLIC_LIVEFORGE_TOPUP_URL_15`, `_30`, `_60` — explicit URLs per tier when you prefer separate landing pages.
 
 ## Run locally
 
