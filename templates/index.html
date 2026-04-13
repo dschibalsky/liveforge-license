@@ -40,6 +40,9 @@
         margin-top: 12px;
       }
       button:hover { background: #1d4ed8; }
+      button.danger { background: #b91c1c; }
+      button.danger:hover { background: #991b1b; }
+      button.secondary { background: #4b5563; }
       pre {
         background: #0b1220;
         border: 1px solid #374151;
@@ -49,15 +52,17 @@
         min-height: 80px;
       }
       .muted { color: #9ca3af; font-size: 12px; }
-      .list { max-height: 280px; overflow: auto; border: 1px solid #374151; border-radius: 8px; }
+      .list { max-height: 360px; overflow: auto; border: 1px solid #374151; border-radius: 8px; }
       .item { padding: 10px 12px; border-bottom: 1px solid #374151; }
       .item:last-child { border-bottom: none; }
-      code { color: #93c5fd; }
+      code { color: #93c5fd; word-break: break-all; }
+      .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+      .row button { width: auto; flex: 1; min-width: 120px; margin-top: 0; }
     </style>
   </head>
   <body>
     <h1>LiveForge License Admin</h1>
-    <p class="muted">Minimal admin UI for users, keys and verification.</p>
+    <p class="muted">Users, keys, verify, hosted wallet (minimal JSON file DB).</p>
 
     <div class="grid">
       <section class="card">
@@ -78,6 +83,25 @@
         <input id="maxDevices" type="number" value="2" min="1" max="100" />
         <label>Expires at (optional RFC3339)</label>
         <input id="expiresAt" placeholder="2027-01-01T00:00:00Z" />
+        <label>Billing</label>
+        <select id="billingMode">
+          <option value="byok">byok (customer API key)</option>
+          <option value="hosted">hosted (prepaid wallet)</option>
+        </select>
+        <label>App edition</label>
+        <select id="allowedEdition">
+          <option value="full">full</option>
+          <option value="cloud">cloud</option>
+        </select>
+        <label>Hosted model tier (optional, t1–t3)</label>
+        <select id="modelTier">
+          <option value="">—</option>
+          <option value="t1">t1</option>
+          <option value="t2">t2</option>
+          <option value="t3">t3</option>
+        </select>
+        <label>Wallet USD (hosted; default 0)</label>
+        <input id="walletUsd" type="number" step="0.01" min="0" value="0" />
         <button onclick="createKey()">Create key</button>
         <pre id="keyResult"></pre>
       </section>
@@ -90,6 +114,16 @@
         <input id="verifyMachine" placeholder="machine-001" />
         <button onclick="verifyKey()">Verify key</button>
         <pre id="verifyResult"></pre>
+      </section>
+
+      <section class="card">
+        <h2>Patch key (admin)</h2>
+        <label>License key</label>
+        <input id="patchKey" placeholder="LF-…" />
+        <label>New wallet USD (set balance)</label>
+        <input id="patchWallet" type="number" step="0.000001" min="0" />
+        <button onclick="patchKey()">Apply wallet balance</button>
+        <pre id="patchResult"></pre>
       </section>
     </div>
 
@@ -129,7 +163,10 @@
         (users.data.users || []).forEach((u) => {
           const div = document.createElement("div");
           div.className = "item";
-          div.innerHTML = `<strong>${u.name}</strong><br><span class="muted">${u.email}</span><br><code>${u.id}</code>`;
+          div.innerHTML = `<strong>${u.name}</strong><br><span class="muted">${u.email}</span><br><code>${u.id}</code>
+            <div class="row">
+              <button class="danger secondary" onclick="deleteUser('${u.id}')">Delete user</button>
+            </div>`;
           usersList.appendChild(div);
 
           const opt = document.createElement("option");
@@ -143,9 +180,63 @@
         (keys.data.keys || []).forEach((k) => {
           const div = document.createElement("div");
           div.className = "item";
-          div.innerHTML = `<strong>${k.key}</strong><br><span class="muted">user=${k.user_id}, devices=${k.activations.length}/${k.max_devices}, status=${k.status}</span>`;
+          const bm = k.billing_mode || "byok";
+          const ed = k.allowed_edition || "full";
+          const tier = k.model_tier || "—";
+          const w =
+            bm === "hosted"
+              ? (k.wallet_balance_usd != null ? Number(k.wallet_balance_usd).toFixed(4) : "0")
+              : "n/a";
+          div.innerHTML = `<strong><code>${k.key}</code></strong><br>
+            <span class="muted">user=${k.user_id} · devices=${k.activations?.length ?? 0}/${k.max_devices} · status=${k.status}<br>
+            billing=<code>${bm}</code> · edition=<code>${ed}</code> · tier=<code>${tier}</code> · wallet USD=${w}</span>
+            <div class="row">
+              <button class="secondary" onclick="revokeKey(${JSON.stringify(k.key)})">Revoke</button>
+              <button class="secondary" onclick="resetDevices(${JSON.stringify(k.key)})">Reset devices</button>
+              <button class="danger" onclick="deleteKey(${JSON.stringify(k.key)})">Delete key</button>
+            </div>`;
           keysList.appendChild(div);
         });
+      }
+
+      async function deleteUser(id) {
+        if (!confirm("Delete user " + id + "? Only allowed if they have no license keys.")) return;
+        const result = await api("/api/users/delete", {
+          method: "POST",
+          body: JSON.stringify({ id }),
+        });
+        alert(result.ok ? "OK" : "Error: " + (result.data.error || result.status));
+        await refresh();
+      }
+
+      async function revokeKey(key) {
+        if (!confirm("Revoke " + key + "?")) return;
+        const result = await api("/api/keys/revoke", {
+          method: "POST",
+          body: JSON.stringify({ key }),
+        });
+        alert(result.ok ? "OK" : JSON.stringify(result.data));
+        await refresh();
+      }
+
+      async function resetDevices(key) {
+        if (!confirm("Clear activations for " + key + "? (Wallet consume history is kept.)")) return;
+        const result = await api("/api/keys/reset-activations", {
+          method: "POST",
+          body: JSON.stringify({ key }),
+        });
+        alert(result.ok ? "OK" : JSON.stringify(result.data));
+        await refresh();
+      }
+
+      async function deleteKey(key) {
+        if (!confirm("Permanently DELETE license " + key + "?")) return;
+        const result = await api("/api/keys/delete", {
+          method: "POST",
+          body: JSON.stringify({ key }),
+        });
+        alert(result.ok ? "OK" : JSON.stringify(result.data));
+        await refresh();
       }
 
       async function createUser() {
@@ -163,8 +254,14 @@
         const user_id = document.getElementById("userSelect").value;
         const max_devices = Number(document.getElementById("maxDevices").value || "2");
         const expires_at = document.getElementById("expiresAt").value.trim();
-        const payload = { user_id, max_devices };
+        const billing_mode = document.getElementById("billingMode").value;
+        const allowed_edition = document.getElementById("allowedEdition").value;
+        const model_tier = document.getElementById("modelTier").value.trim();
+        const walletVal = Number(document.getElementById("walletUsd").value || "0");
+        const payload = { user_id, max_devices, billing_mode, allowed_edition };
         if (expires_at) payload.expires_at = expires_at;
+        if (model_tier) payload.model_tier = model_tier;
+        if (billing_mode === "hosted") payload.wallet_balance_usd = walletVal;
         const result = await api("/api/keys", {
           method: "POST",
           body: JSON.stringify(payload),
@@ -183,6 +280,26 @@
           body: JSON.stringify(payload),
         });
         print(document.getElementById("verifyResult"), result);
+        await refresh();
+      }
+
+      async function patchKey() {
+        const key = document.getElementById("patchKey").value.trim().toUpperCase();
+        const w = document.getElementById("patchWallet").value;
+        if (!key) {
+          alert("Enter license key");
+          return;
+        }
+        if (w === "") {
+          alert("Enter wallet USD");
+          return;
+        }
+        const wallet_balance_usd = Number(w);
+        const result = await api("/api/keys/patch", {
+          method: "POST",
+          body: JSON.stringify({ key, wallet_balance_usd }),
+        });
+        print(document.getElementById("patchResult"), result);
         await refresh();
       }
 

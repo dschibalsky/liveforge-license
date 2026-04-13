@@ -21,6 +21,7 @@ services:
       UPDATES_DIR: "/app/updates"
       UPDATES_UPLOAD_TOKEN: "${UPDATES_UPLOAD_TOKEN}"
       UPDATES_MAX_UPLOAD_MB: "${UPDATES_MAX_UPLOAD_MB:-2048}"
+      CONSUME_SECRET: "${CONSUME_SECRET}"
     volumes:
       - ./data:/app/data
       - ./updates:/app/updates
@@ -28,7 +29,7 @@ services:
       - "traefik.enable=true"
       # Public API route for app-side license checks (no BasicAuth)
       - "traefik.http.routers.liveforge-license-api.entrypoints=https"
-      - "traefik.http.routers.liveforge-license-api.rule=Host(`liveforge.hideandpass.com`) && Path(`/api/keys/verify`)"
+      - "traefik.http.routers.liveforge-license-api.rule=Host(`liveforge.hideandpass.com`) && (Path(`/api/keys/verify`) || Path(`/api/keys/consume`))"
       - "traefik.http.routers.liveforge-license-api.priority=200"
       - "traefik.http.routers.liveforge-license-api.tls=true"
       - "traefik.http.routers.liveforge-license-api.tls.certresolver=http"

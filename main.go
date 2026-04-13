@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"os"
@@ -36,14 +37,22 @@ type activationRecord struct {
 }
 
 type licenseRecord struct {
-	Key         string             `json:"key"`
-	KeyLast4    string             `json:"key_last4"`
-	UserID      string             `json:"user_id"`
-	Status      string             `json:"status"`
-	MaxDevices  int                `json:"max_devices"`
-	CreatedAt   string             `json:"created_at"`
-	ExpiresAt   string             `json:"expires_at,omitempty"`
-	Activations []activationRecord `json:"activations"`
+	Key         string `json:"key"`
+	KeyLast4    string `json:"key_last4"`
+	UserID      string `json:"user_id"`
+	Status      string `json:"status"`
+	MaxDevices  int    `json:"max_devices"`
+	CreatedAt   string `json:"created_at"`
+	ExpiresAt   string `json:"expires_at,omitempty"`
+	BillingMode string `json:"billing_mode,omitempty"`
+	// AllowedEdition: full (default) or cloud — must match app build when enforced client-side.
+	AllowedEdition string `json:"allowed_edition,omitempty"`
+	// WalletBalanceUSD used when BillingMode is hosted (prepaid inference balance).
+	WalletBalanceUSD float64            `json:"wallet_balance_usd"`
+	ModelTier        string             `json:"model_tier,omitempty"`
+	Activations      []activationRecord `json:"activations"`
+	// ConsumedTraceIDs deduplicates POST /api/keys/consume (idempotent wallet debits).
+	ConsumedTraceIDs []string `json:"consumed_trace_ids,omitempty"`
 }
 
 type dbData struct {
@@ -56,6 +65,7 @@ type app struct {
 	dataFile           string
 	updatesDir         string
 	updatesUploadToken string
+	consumeSecret      string
 	maxUploadBytes     int64
 	data               dbData
 	tpl                *template.Template
@@ -83,6 +93,7 @@ func main() {
 		dataFile:           dataFile,
 		updatesDir:         updatesDir,
 		updatesUploadToken: updatesUploadToken,
+		consumeSecret:      strings.TrimSpace(os.Getenv("CONSUME_SECRET")),
 		maxUploadBytes:     maxUploadBytes,
 		tpl:                tpl,
 	}
@@ -98,6 +109,12 @@ func main() {
 	mux.HandleFunc("/api/users", a.handleUsers)
 	mux.HandleFunc("/api/keys", a.handleKeys)
 	mux.HandleFunc("/api/keys/verify", a.handleVerifyKey)
+	mux.HandleFunc("/api/keys/consume", a.handleConsumeWallet)
+	mux.HandleFunc("/api/keys/revoke", a.handleKeyRevoke)
+	mux.HandleFunc("/api/keys/delete", a.handleKeyDelete)
+	mux.HandleFunc("/api/keys/reset-activations", a.handleKeyResetActivations)
+	mux.HandleFunc("/api/keys/patch", a.handleKeyPatch)
+	mux.HandleFunc("/api/users/delete", a.handleUserDelete)
 	mux.HandleFunc("/api/updates/upload", a.handleUploadUpdateAsset)
 	mux.HandleFunc("/api/updates/files", a.handleListUpdateAssets)
 	mux.Handle("/updates/",
@@ -173,6 +190,50 @@ func (a *app) handleUsers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *app) handleUserDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_json"})
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "id_required"})
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, lic := range a.data.Licenses {
+		if lic.UserID == id {
+			writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": "user_has_licenses"})
+			return
+		}
+	}
+	idx := -1
+	for i, u := range a.data.Users {
+		if u.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "user_not_found"})
+		return
+	}
+	a.data.Users = append(a.data.Users[:idx], a.data.Users[idx+1:]...)
+	if err := a.saveLocked(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "save_failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (a *app) handleKeys(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -192,9 +253,13 @@ func (a *app) handleKeys(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "keys": keys})
 	case http.MethodPost:
 		var req struct {
-			UserID     string `json:"user_id"`
-			MaxDevices int    `json:"max_devices"`
-			ExpiresAt  string `json:"expires_at"`
+			UserID           string   `json:"user_id"`
+			MaxDevices       int      `json:"max_devices"`
+			ExpiresAt        string   `json:"expires_at"`
+			BillingMode      string   `json:"billing_mode"`
+			AllowedEdition   string   `json:"allowed_edition"`
+			WalletBalanceUSD *float64 `json:"wallet_balance_usd"`
+			ModelTier        string   `json:"model_tier"`
 		}
 		if err := decodeJSON(r.Body, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_json"})
@@ -227,16 +292,51 @@ func (a *app) handleKeys(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		bm := strings.ToLower(strings.TrimSpace(req.BillingMode))
+		if bm == "" {
+			bm = "byok"
+		}
+		if bm != "byok" && bm != "hosted" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_billing_mode"})
+			return
+		}
+		ed := strings.ToLower(strings.TrimSpace(req.AllowedEdition))
+		if ed == "" {
+			ed = "full"
+		}
+		if ed != "full" && ed != "cloud" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_allowed_edition"})
+			return
+		}
+		tier := strings.ToLower(strings.TrimSpace(req.ModelTier))
+		if tier != "" && tier != "t1" && tier != "t2" && tier != "t3" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_model_tier"})
+			return
+		}
+		wallet := 0.0
+		if req.WalletBalanceUSD != nil {
+			wallet = *req.WalletBalanceUSD
+		}
+		if wallet < 0 || math.IsNaN(wallet) || math.IsInf(wallet, 0) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_wallet_balance"})
+			return
+		}
+
 		key := generateLicenseKey()
 		rec := licenseRecord{
-			Key:         key,
-			KeyLast4:    key[len(key)-4:],
-			UserID:      req.UserID,
-			Status:      "active",
-			MaxDevices:  req.MaxDevices,
-			CreatedAt:   nowISO(),
-			ExpiresAt:   req.ExpiresAt,
-			Activations: []activationRecord{},
+			Key:              key,
+			KeyLast4:         key[len(key)-4:],
+			UserID:           req.UserID,
+			Status:           "active",
+			MaxDevices:       req.MaxDevices,
+			CreatedAt:        nowISO(),
+			ExpiresAt:        req.ExpiresAt,
+			BillingMode:      bm,
+			AllowedEdition:   ed,
+			WalletBalanceUSD: wallet,
+			ModelTier:        tier,
+			Activations:      []activationRecord{},
+			ConsumedTraceIDs: []string{},
 		}
 		a.data.Licenses = append(a.data.Licenses, rec)
 		if err := a.saveLocked(); err != nil {
@@ -326,17 +426,315 @@ func (a *app) handleVerifyKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true,
-		"license": map[string]any{
-			"key_last4":      rec.KeyLast4,
-			"user_id":        rec.UserID,
-			"status":         rec.Status,
-			"max_devices":    rec.MaxDevices,
-			"active_devices": len(rec.Activations),
-			"expires_at":     rec.ExpiresAt,
-		},
+		"ok":           true,
+		"license":      licenseVerifyJSON(rec),
 		"validated_at": nowISO(),
 	})
+}
+
+func licenseVerifyJSON(rec *licenseRecord) map[string]any {
+	out := map[string]any{
+		"key_last4":       rec.KeyLast4,
+		"user_id":         rec.UserID,
+		"status":          rec.Status,
+		"max_devices":     rec.MaxDevices,
+		"active_devices":  len(rec.Activations),
+		"expires_at":      rec.ExpiresAt,
+		"billing_mode":    rec.BillingMode,
+		"allowed_edition": rec.AllowedEdition,
+	}
+	if strings.EqualFold(rec.BillingMode, "hosted") {
+		out["wallet_balance_usd"] = rec.WalletBalanceUSD
+	}
+	if rec.ModelTier != "" {
+		out["model_tier"] = rec.ModelTier
+	}
+	return out
+}
+
+const maxConsumedTraceIDsPerLicense = 2500
+
+func (a *app) consumeAuthOK(r *http.Request) bool {
+	if strings.TrimSpace(a.consumeSecret) == "" {
+		return true
+	}
+	got := strings.TrimSpace(r.Header.Get("x-liveforge-consume-secret"))
+	return subtle.ConstantTimeCompare([]byte(got), []byte(a.consumeSecret)) == 1
+}
+
+func (a *app) handleConsumeWallet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !a.consumeAuthOK(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "unauthorized_consume"})
+		return
+	}
+	var req struct {
+		LicenseKey      string  `json:"license_key"`
+		MachineID       string  `json:"machine_id"`
+		TraceID         string  `json:"trace_id"`
+		SessionID       string  `json:"session_id"` // accepted for logging compatibility; not persisted here
+		ProviderCostUSD float64 `json:"provider_cost_usd"`
+		WalletDebitUSD  float64 `json:"wallet_debit_usd"`
+		Estimated       bool    `json:"estimated"`
+		BillingMode     string  `json:"billing_mode"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_json"})
+		return
+	}
+	req.LicenseKey = strings.ToUpper(strings.TrimSpace(req.LicenseKey))
+	req.MachineID = strings.TrimSpace(req.MachineID)
+	req.TraceID = strings.TrimSpace(req.TraceID)
+	if req.LicenseKey == "" || req.MachineID == "" || req.TraceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "missing_fields"})
+		return
+	}
+	if req.WalletDebitUSD < 0 || math.IsNaN(req.WalletDebitUSD) || math.IsInf(req.WalletDebitUSD, 0) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_wallet_debit"})
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(req.BillingMode)) != "hosted" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "billing_mode_must_be_hosted"})
+		return
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	idx := -1
+	for i := range a.data.Licenses {
+		if strings.EqualFold(a.data.Licenses[i].Key, req.LicenseKey) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "invalid_key"})
+		return
+	}
+	rec := &a.data.Licenses[idx]
+	if rec.Status != "active" {
+		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "revoked"})
+		return
+	}
+	if !strings.EqualFold(rec.BillingMode, "hosted") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "license_not_hosted"})
+		return
+	}
+	activated := false
+	for _, act := range rec.Activations {
+		if act.MachineID == req.MachineID {
+			activated = true
+			break
+		}
+	}
+	if !activated {
+		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "machine_not_activated"})
+		return
+	}
+	for _, t := range rec.ConsumedTraceIDs {
+		if t == req.TraceID {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "idempotent": true, "license": licenseVerifyJSON(rec)})
+			return
+		}
+	}
+	if req.WalletDebitUSD > rec.WalletBalanceUSD+1e-9 {
+		writeJSON(w, http.StatusPaymentRequired, map[string]any{"ok": false, "error": "insufficient_balance"})
+		return
+	}
+	rec.WalletBalanceUSD = math.Round((rec.WalletBalanceUSD-req.WalletDebitUSD)*1e6) / 1e6
+	rec.ConsumedTraceIDs = append(rec.ConsumedTraceIDs, req.TraceID)
+	if len(rec.ConsumedTraceIDs) > maxConsumedTraceIDsPerLicense {
+		rec.ConsumedTraceIDs = rec.ConsumedTraceIDs[len(rec.ConsumedTraceIDs)-maxConsumedTraceIDsPerLicense:]
+	}
+	if err := a.saveLocked(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "save_failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "license": licenseVerifyJSON(rec)})
+}
+
+func (a *app) handleKeyRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.applyKeyMutation(w, r, func(rec *licenseRecord) {
+		rec.Status = "revoked"
+	})
+}
+
+func (a *app) handleKeyDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Key string `json:"key"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_json"})
+		return
+	}
+	key := strings.ToUpper(strings.TrimSpace(req.Key))
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "key_required"})
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	idx := -1
+	for i := range a.data.Licenses {
+		if strings.EqualFold(a.data.Licenses[i].Key, key) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "key_not_found"})
+		return
+	}
+	a.data.Licenses = append(a.data.Licenses[:idx], a.data.Licenses[idx+1:]...)
+	if err := a.saveLocked(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "save_failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *app) handleKeyResetActivations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.applyKeyMutation(w, r, func(rec *licenseRecord) {
+		rec.Activations = []activationRecord{}
+	})
+}
+
+func (a *app) handleKeyPatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Key              string   `json:"key"`
+		Status           string   `json:"status"`
+		MaxDevices       *int     `json:"max_devices"`
+		WalletBalanceUSD *float64 `json:"wallet_balance_usd"`
+		BillingMode      string   `json:"billing_mode"`
+		AllowedEdition   string   `json:"allowed_edition"`
+		ModelTier        string   `json:"model_tier"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_json"})
+		return
+	}
+	key := strings.ToUpper(strings.TrimSpace(req.Key))
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "key_required"})
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	idx := -1
+	for i := range a.data.Licenses {
+		if strings.EqualFold(a.data.Licenses[i].Key, key) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "key_not_found"})
+		return
+	}
+	rec := &a.data.Licenses[idx]
+	if s := strings.TrimSpace(req.Status); s != "" {
+		if s != "active" && s != "revoked" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_status"})
+			return
+		}
+		rec.Status = s
+	}
+	if req.MaxDevices != nil {
+		if *req.MaxDevices < 1 || *req.MaxDevices > 100 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_max_devices"})
+			return
+		}
+		rec.MaxDevices = *req.MaxDevices
+	}
+	if req.WalletBalanceUSD != nil {
+		v := *req.WalletBalanceUSD
+		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_wallet_balance"})
+			return
+		}
+		rec.WalletBalanceUSD = v
+	}
+	if bm := strings.ToLower(strings.TrimSpace(req.BillingMode)); bm != "" {
+		if bm != "byok" && bm != "hosted" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_billing_mode"})
+			return
+		}
+		rec.BillingMode = bm
+	}
+	if ed := strings.ToLower(strings.TrimSpace(req.AllowedEdition)); ed != "" {
+		if ed != "full" && ed != "cloud" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_allowed_edition"})
+			return
+		}
+		rec.AllowedEdition = ed
+	}
+	if tier := strings.ToLower(strings.TrimSpace(req.ModelTier)); tier != "" {
+		if tier != "t1" && tier != "t2" && tier != "t3" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_model_tier"})
+			return
+		}
+		rec.ModelTier = tier
+	}
+	if err := a.saveLocked(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "save_failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": *rec})
+}
+
+func (a *app) applyKeyMutation(w http.ResponseWriter, r *http.Request, fn func(rec *licenseRecord)) {
+	var req struct {
+		Key string `json:"key"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid_json"})
+		return
+	}
+	key := strings.ToUpper(strings.TrimSpace(req.Key))
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "key_required"})
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	idx := -1
+	for i := range a.data.Licenses {
+		if strings.EqualFold(a.data.Licenses[i].Key, key) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "key_not_found"})
+		return
+	}
+	rec := &a.data.Licenses[idx]
+	fn(rec)
+	if err := a.saveLocked(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "save_failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": *rec})
 }
 
 func (a *app) hasValidUpdateUploadToken(r *http.Request) bool {
@@ -522,7 +920,23 @@ func (a *app) load() error {
 	if a.data.Licenses == nil {
 		a.data.Licenses = []licenseRecord{}
 	}
+	migrateLicenses(&a.data.Licenses)
 	return nil
+}
+
+func migrateLicenses(lics *[]licenseRecord) {
+	for i := range *lics {
+		rec := &(*lics)[i]
+		if rec.BillingMode == "" {
+			rec.BillingMode = "byok"
+		}
+		if rec.AllowedEdition == "" {
+			rec.AllowedEdition = "full"
+		}
+		if rec.ConsumedTraceIDs == nil {
+			rec.ConsumedTraceIDs = []string{}
+		}
+	}
 }
 
 func (a *app) saveLocked() error {
